@@ -1,7 +1,9 @@
 package migrations
 
 import (
+	"bytes"
 	"fmt"
+	"html/template"
 	"io/ioutil"
 	"os"
 	"path"
@@ -10,7 +12,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/go-pg/pg"
+	"github.com/go-pg/pg/v9"
 	"github.com/pkg/errors"
 )
 
@@ -55,28 +57,52 @@ func Register(name string, up, down func(*pg.Tx) error) {
 	}
 }
 
-func Run(db *pg.DB, a ...string) error {
-	var cmd string
-	if len(a) > 0 {
-		cmd = a[0]
-	}
-
+/*
+Run Runs the specified command with the options they require
+Note:
+	init - no options
+	migrate - one option
+		- "" for all migrations in a single batch
+		- "one-by-one" for one migration in a batch mode
+	rollback - no options
+	create - two options
+		- name - name of the migration (must be first)
+		- template - string that contains the go code to use as a template. see migrationTemplate
+*/
+func Run(db *pg.DB, cmd string, options ...string) error {
 	switch cmd {
 	case "init":
 		return initialise(db)
+
 	case "migrate":
-		return migrate(db)
+		extra := ""
+		if len(options) > 0 {
+			extra = options[0]
+		}
+		return migrate(db, extra == "one-by-one")
+
 	case "rollback":
 		return rollback(db)
-	case "create":
-		if len(a) < 2 {
-			return errors.New("Please enter migration description")
-		}
-		return create(strings.Join(a[1:], "_"))
-	default:
-		return errors.Errorf("unsupported command: %q", cmd)
 
+	case "create":
+		name := ""
+		template := ""
+		if len(options) > 0 {
+			name = options[0]
+		}
+		if len(options) > 1 {
+			template = options[1]
+		}
+		if len(name) == 0 {
+			return errors.New("Please enter migration name")
+		}
+
+		name = strings.Replace(name, " ", "_", -1)
+
+		return create(name, template)
 	}
+
+	return errors.Errorf("unsupported command: %q", cmd)
 }
 
 func initialise(db *pg.DB) error {
@@ -127,68 +153,135 @@ func initialise(db *pg.DB) error {
 	})
 }
 
-func migrate(db *pg.DB) error {
-	return db.RunInTransaction(func(tx *pg.Tx) (err error) {
+func getMigrationsToRun(tx *pg.Tx) ([]string, error) {
+	var migrations []string
 
-		err = lockTable(tx)
+	migrations, err := getCompletedMigrations(tx)
+	if err != nil {
+		return nil, err
+	}
 
-		if err != nil {
-			return
-		}
+	missingMigrations := difference(migrations, migrationNames)
+	if len(missingMigrations) > 0 {
+		return nil, errors.Errorf("Migrations table corrupt: %+v", missingMigrations)
+	}
 
-		var migrations []string
+	migrationsToRun := difference(migrationNames, migrations)
 
-		migrations, err = getCompletedMigrations(tx)
+	if len(migrationsToRun) > 0 {
+		sort.Strings(migrationsToRun)
+	}
 
-		if err != nil {
-			return
-		}
+	return migrationsToRun, nil
+}
+func migrate(db *pg.DB, oneByOne bool) error {
+	if oneByOne {
+		return migrateOneByOne(db)
+	}
+	return migrateOneBatch(db)
+}
 
-		missingMigrations := difference(migrations, migrationNames)
+func migrateOneByOne(db *pg.DB) error {
 
-		if len(missingMigrations) > 0 {
-			return errors.New("Migrations table corrupt")
-		}
+	var migrationsToRun []string
 
-		migrationsToRun := difference(migrationNames, migrations)
-
-		if len(migrationsToRun) > 0 {
-			var batch int
-			batch, err = getBatchNumber(tx)
-
+	err := db.RunInTransaction(
+		func(tx *pg.Tx) (err error) {
+			err = lockTable(tx)
 			if err != nil {
 				return
 			}
 
-			batch++
+			migrationsToRun, err = getMigrationsToRun(tx)
+			return
+		})
 
-			sort.Slice(migrationsToRun, func(i, j int) bool {
-				switch strings.Compare(migrationsToRun[i], migrationsToRun[j]) {
-				case -1:
-					return true
-				case 1:
-					return false
+	if err != nil {
+		return err
+	}
+
+	if len(migrationsToRun) == 0 {
+		return nil
+	}
+
+	for _, migration := range migrationsToRun {
+		err := db.RunInTransaction(
+			func(tx *pg.Tx) (err error) {
+				err = lockTable(tx)
+				if err != nil {
+					return
 				}
-				return true
-			})
 
-			fmt.Printf("Batch %d run: %d migrations\n", batch, len(migrationsToRun))
+				var batch int
+				batch, err = getBatchNumber(tx)
+				if err != nil {
+					return
+				}
 
-			for _, migration := range migrationsToRun {
+				batch++
+
+				fmt.Printf("Batch %d run: 1 migration - %s\n", batch, migration)
+
 				err = allMigrations[migration].Up(tx)
-
 				if err != nil {
 					err = errors.Wrapf(err, "%s failed to migrate", migration)
 					return
 				}
 
 				err = insertCompletedMigration(tx, migration, batch)
+				return
+			})
+		if err != nil {
+			return err
+		}
+	}
 
-				if err != nil {
-					return
-				}
+	return nil
+}
+
+func migrateOneBatch(db *pg.DB) error {
+	return db.RunInTransaction(func(tx *pg.Tx) (err error) {
+
+		err = lockTable(tx)
+		if err != nil {
+			return
+		}
+
+		var migrationsToRun []string
+		migrationsToRun, err = getMigrationsToRun(tx)
+		if err != nil {
+			return
+		}
+
+		if len(migrationsToRun) == 0 {
+			return
+		}
+
+		var batch int
+		batch, err = getBatchNumber(tx)
+		if err != nil {
+			return
+		}
+
+		batch++
+
+		fmt.Printf("Batch %d run: %d migrations\n", batch, len(migrationsToRun))
+
+		for _, migration := range migrationsToRun {
+			err = allMigrations[migration].Up(tx)
+
+			if err != nil {
+				err = errors.Wrapf(err, "%s failed to migrate", migration)
+				return
+			}
+
+			err = insertCompletedMigration(tx, migration, batch)
+
+			if err != nil {
+				return
 			}
 		}
+
 		return
 	})
 }
@@ -261,7 +354,7 @@ func rollback(db *pg.DB) error {
 	})
 }
 
-func create(description string) error {
+func create(description, template string) error {
 	var filename, funcName string
 
 	if migrationNameConvention == SnakeCase {
@@ -274,7 +367,7 @@ func create(description string) error {
 		funcName = filename
 	}
 
-	filePath, err := createMigrationFile(filename, funcName)
+	filePath, err := createMigrationFile(filename, funcName, template)
 	if err != nil {
 		return err
 	}
@@ -400,7 +493,7 @@ func convertSnakeCaseToCamelCase(word string) (result string) {
 	return
 }
 
-func createMigrationFile(filename, funcName string) (string, error) {
+func createMigrationFile(filename, funcName, templateString string) (string, error) {
 	basepath, err := os.Getwd()
 	if err != nil {
 		return "", err
@@ -409,35 +502,53 @@ func createMigrationFile(filename, funcName string) (string, error) {
 
 	_, err = os.Stat(filePath)
 	if !os.IsNotExist(err) {
-		return "", fmt.Errorf("file=%q already exists (%s)", filename, err)
+		return "", fmt.Errorf("file=%s already exists (%v)", filename, err)
 	}
 
 	filePath += ".go"
 
-	return filePath, ioutil.WriteFile(filePath, []byte(fmt.Sprintf(migrationTemplate, filename, funcName, funcName, funcName, funcName)), 0644)
+	if len(templateString) == 0 {
+		templateString = migrationTemplate
+	}
+
+	data := map[string]interface{}{
+		"Filename": filename,
+		"FuncName": funcName,
+	}
+
+	t := template.Must(template.New("template").Parse(templateString))
+
+	buf := &bytes.Buffer{}
+	if err := t.Execute(buf, data); err != nil {
+		return "", fmt.Errorf("Failed to populate migration template %v", err)
+	}
+
+	templateString = buf.String()
+
+	return filePath, ioutil.WriteFile(filePath, []byte(templateString), 0644)
 }
 
 var migrationTemplate = `package main
 
 import (
 	"github.com/go-pg/pg"
-	migrations "github.com/hbarnardt/hb_migrations"
+	migrations "github.com/getkalido/hb_migrations"
 )
 
 func init() {
 	migrations.Register(
-		"%s",
-		up%s,
-		down%s,
+		"{{.Filename}}",
+		up{{.FuncName}},
+		down{{.FuncName}},
 	)
 }
 
-func up%s(tx *pg.Tx) error {
+func up{{.FuncName}}(tx *pg.Tx) error {
 	_, err := tx.Exec(` + "`" + "`" + `)
 	return err
 }
 
-func down%s(tx *pg.Tx) error {
+func down{{.FuncName}}(tx *pg.Tx) error {
 	_, err := tx.Exec(` + "`" + "`" + `)
 	return err
 }
