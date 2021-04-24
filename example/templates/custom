@@ -1,0 +1,26 @@
+package main
+
+import (
+	migrations "github.com/dbreedt/hb_migrations"
+	"github.com/go-pg/pg/v10"
+)
+
+func init() {
+	migrations.Register(
+		"{{.Filename}}",
+		up{{.FuncName}},
+		down{{.FuncName}},
+	)
+}
+
+// Custom Template
+
+func up{{.FuncName}}(tx *pg.Tx) error {
+	_, err := tx.Exec(``)
+	return err
+}
+
+func down{{.FuncName}}(tx *pg.Tx) error {
+	_, err := tx.Exec(``)
+	return err
+}
