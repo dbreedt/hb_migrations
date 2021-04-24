@@ -2,6 +2,7 @@ package migrations
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"html/template"
 	"io/ioutil"
@@ -12,7 +13,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/go-pg/pg/v9"
+	"github.com/go-pg/pg/v10"
 	"github.com/pkg/errors"
 )
 
@@ -29,11 +30,13 @@ const (
 	SnakeCase MigrationNameConvention = "snakeCase"
 )
 
-var migrationTableName = "public.hb_migrations"
-var initialMigration = "000000000000_init"
-var migrationNameConvention = SnakeCase
-var allMigrations = make(map[string]migration)
-var migrationNames []string
+var (
+	migrationTableName      = "migrations"
+	initialMigration        = "000000000000_init"
+	migrationNameConvention = SnakeCase
+	allMigrations           = make(map[string]migration)
+	migrationNames          []string
+)
 
 func SetMigrationTableName(tableName string) {
 	migrationTableName = tableName
@@ -69,20 +72,20 @@ Note:
 		- name - name of the migration (must be first)
 		- template - string that contains the go code to use as a template. see migrationTemplate
 */
-func Run(db *pg.DB, cmd string, options ...string) error {
+func Run(ctx context.Context, db *pg.DB, cmd string, options ...string) error {
 	switch cmd {
 	case "init":
-		return initialise(db)
+		return initialise(ctx, db)
 
 	case "migrate":
 		extra := ""
 		if len(options) > 0 {
 			extra = options[0]
 		}
-		return migrate(db, extra == "one-by-one")
+		return migrate(ctx, db, extra == "one-by-one")
 
 	case "rollback":
-		return rollback(db)
+		return rollback(ctx, db)
 
 	case "create":
 		name := ""
@@ -105,9 +108,8 @@ func Run(db *pg.DB, cmd string, options ...string) error {
 	return errors.Errorf("unsupported command: %q", cmd)
 }
 
-func initialise(db *pg.DB) error {
-	return db.RunInTransaction(func(tx *pg.Tx) (err error) {
-
+func initialise(ctx context.Context, db *pg.DB) error {
+	return db.RunInTransaction(ctx, func(tx *pg.Tx) (err error) {
 		err = lockTable(tx)
 
 		if err != nil {
@@ -174,18 +176,18 @@ func getMigrationsToRun(tx *pg.Tx) ([]string, error) {
 
 	return migrationsToRun, nil
 }
-func migrate(db *pg.DB, oneByOne bool) error {
+
+func migrate(ctx context.Context, db *pg.DB, oneByOne bool) error {
 	if oneByOne {
-		return migrateOneByOne(db)
+		return migrateOneByOne(ctx, db)
 	}
-	return migrateOneBatch(db)
+	return migrateOneBatch(ctx, db)
 }
 
-func migrateOneByOne(db *pg.DB) error {
-
+func migrateOneByOne(ctx context.Context, db *pg.DB) error {
 	var migrationsToRun []string
 
-	err := db.RunInTransaction(
+	err := db.RunInTransaction(ctx,
 		func(tx *pg.Tx) (err error) {
 			err = lockTable(tx)
 			if err != nil {
@@ -195,7 +197,6 @@ func migrateOneByOne(db *pg.DB) error {
 			migrationsToRun, err = getMigrationsToRun(tx)
 			return
 		})
-
 	if err != nil {
 		return err
 	}
@@ -205,7 +206,7 @@ func migrateOneByOne(db *pg.DB) error {
 	}
 
 	for _, migration := range migrationsToRun {
-		err := db.RunInTransaction(
+		err := db.RunInTransaction(ctx,
 			func(tx *pg.Tx) (err error) {
 				err = lockTable(tx)
 				if err != nil {
@@ -239,119 +240,118 @@ func migrateOneByOne(db *pg.DB) error {
 	return nil
 }
 
-func migrateOneBatch(db *pg.DB) error {
-	return db.RunInTransaction(func(tx *pg.Tx) (err error) {
-
-		err = lockTable(tx)
-		if err != nil {
-			return
-		}
-
-		var migrationsToRun []string
-		migrationsToRun, err = getMigrationsToRun(tx)
-		if err != nil {
-			return
-		}
-
-		if len(migrationsToRun) == 0 {
-			return
-		}
-
-		var batch int
-		batch, err = getBatchNumber(tx)
-		if err != nil {
-			return
-		}
-
-		batch++
-
-		fmt.Printf("Batch %d run: %d migrations\n", batch, len(migrationsToRun))
-
-		for _, migration := range migrationsToRun {
-			err = allMigrations[migration].Up(tx)
-
-			if err != nil {
-				err = errors.Wrapf(err, "%s failed to migrate", migration)
-				return
-			}
-
-			err = insertCompletedMigration(tx, migration, batch)
-
+func migrateOneBatch(ctx context.Context, db *pg.DB) error {
+	return db.RunInTransaction(ctx,
+		func(tx *pg.Tx) (err error) {
+			err = lockTable(tx)
 			if err != nil {
 				return
 			}
-		}
 
-		return
-	})
-}
+			var migrationsToRun []string
+			migrationsToRun, err = getMigrationsToRun(tx)
+			if err != nil {
+				return
+			}
 
-func rollback(db *pg.DB) error {
-	return db.RunInTransaction(func(tx *pg.Tx) (err error) {
+			if len(migrationsToRun) == 0 {
+				return
+			}
 
-		err = lockTable(tx)
+			var batch int
+			batch, err = getBatchNumber(tx)
+			if err != nil {
+				return
+			}
 
-		if err != nil {
-			return
-		}
+			batch++
 
-		var migrations []string
-
-		migrations, err = getCompletedMigrations(tx)
-
-		if err != nil {
-			return
-		}
-
-		missingMigrations := difference(migrations, migrationNames)
-
-		if len(missingMigrations) > 0 {
-			return errors.New("Migrations table corrupt")
-		}
-
-		var batch int
-		batch, err = getBatchNumber(tx)
-
-		if err != nil {
-			return
-		}
-
-		migrationsToRun, err := getMigrationsInBatch(tx, batch)
-
-		if err != nil {
-			return
-		}
-
-		if len(migrationsToRun) > 0 {
-			sort.Slice(migrationsToRun, func(i, j int) bool {
-				switch strings.Compare(migrationsToRun[i], migrationsToRun[j]) {
-				case -1:
-					return false
-				case 1:
-					return true
-				}
-				return false
-			})
-
-			fmt.Printf("Batch %d rollback: %d migrations\n", batch, len(migrationsToRun))
+			fmt.Printf("Batch %d run: %d migrations\n", batch, len(migrationsToRun))
 
 			for _, migration := range migrationsToRun {
-				err = allMigrations[migration].Down(tx)
+				err = allMigrations[migration].Up(tx)
 
 				if err != nil {
-					err = errors.Wrapf(err, "%s failed to rollback", migration)
-					break
+					err = errors.Wrapf(err, "%s failed to migrate", migration)
+					return
 				}
 
-				err = removeRolledbackMigration(tx, migration)
+				err = insertCompletedMigration(tx, migration, batch)
 
 				if err != nil {
 					return
 				}
 			}
-		}
-		return
-	})
+
+			return
+		})
+}
+
+func rollback(ctx context.Context, db *pg.DB) error {
+	return db.RunInTransaction(ctx,
+		func(tx *pg.Tx) (err error) {
+			err = lockTable(tx)
+
+			if err != nil {
+				return
+			}
+
+			var migrations []string
+
+			migrations, err = getCompletedMigrations(tx)
+
+			if err != nil {
+				return
+			}
+
+			missingMigrations := difference(migrations, migrationNames)
+
+			if len(missingMigrations) > 0 {
+				return errors.New("Migrations table corrupt")
+			}
+
+			var batch int
+			batch, err = getBatchNumber(tx)
+
+			if err != nil {
+				return
+			}
+
+			migrationsToRun, err := getMigrationsInBatch(tx, batch)
+			if err != nil {
+				return
+			}
+
+			if len(migrationsToRun) > 0 {
+				sort.Slice(migrationsToRun, func(i, j int) bool {
+					switch strings.Compare(migrationsToRun[i], migrationsToRun[j]) {
+					case -1:
+						return false
+					case 1:
+						return true
+					}
+					return false
+				})
+
+				fmt.Printf("Batch %d rollback: %d migrations\n", batch, len(migrationsToRun))
+
+				for _, migration := range migrationsToRun {
+					err = allMigrations[migration].Down(tx)
+
+					if err != nil {
+						err = errors.Wrapf(err, "%s failed to rollback", migration)
+						break
+					}
+
+					err = removeRolledbackMigration(tx, migration)
+
+					if err != nil {
+						return
+					}
+				}
+			}
+			return
+		})
 }
 
 func create(description, template string) error {
@@ -377,27 +377,25 @@ func create(description, template string) error {
 }
 
 func lockTable(tx *pg.Tx) error {
-
 	_, err := tx.Exec(`
-			CREATE TABLE IF NOT EXISTS ? (
+			CREATE TABLE IF NOT EXISTS ` + migrationTableName + `(
 				id serial,
 				name varchar,
 				batch integer,
 				migration_time timestamptz
 			)
-		`, pg.Q(migrationTableName))
+		`)
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec("LOCK ? ", pg.Q(migrationTableName))
+	_, err = tx.Exec("LOCK " + migrationTableName)
 
 	return err
 }
 
 func insertCompletedMigration(tx *pg.Tx, name string, batch int) error {
 	fmt.Printf("Completed %s\n", name)
-	_, err := tx.Exec("insert into ? (name, batch, migration_time) values (?, ?, now())", pg.Q(migrationTableName), name, batch)
-
+	_, err := tx.Exec("insert into "+migrationTableName+"(name, batch, migration_time) values (?, ?, now())", name, batch)
 	if err != nil {
 		return err
 	}
@@ -407,8 +405,7 @@ func insertCompletedMigration(tx *pg.Tx, name string, batch int) error {
 
 func removeRolledbackMigration(tx *pg.Tx, name string) error {
 	fmt.Printf("Rolledback %s\n", name)
-	_, err := tx.Exec("delete from ? where name = ?", pg.Q(migrationTableName), name)
-
+	_, err := tx.Exec("delete from "+migrationTableName+" where name = ?", name)
 	if err != nil {
 		return err
 	}
@@ -419,8 +416,10 @@ func removeRolledbackMigration(tx *pg.Tx, name string) error {
 func getCompletedMigrations(tx *pg.Tx) ([]string, error) {
 	var results []string
 
-	_, err := tx.Query(&results, "select name from ?", pg.Q(migrationTableName))
-
+	err := tx.Model().
+		Table(migrationTableName).
+		Column("name").
+		Select(&results)
 	if err != nil {
 		return nil, err
 	}
@@ -431,8 +430,12 @@ func getCompletedMigrations(tx *pg.Tx) ([]string, error) {
 func getMigrationsInBatch(tx *pg.Tx, batch int) ([]string, error) {
 	var results []string
 
-	_, err := tx.Query(&results, "select name from ? where batch = ? order by id desc", pg.Q(migrationTableName), batch)
-
+	err := tx.Model().
+		Table(migrationTableName).
+		Column("name").
+		Where("batch = ?", batch).
+		OrderExpr("id desc").
+		Select(&results)
 	if err != nil {
 		return nil, err
 	}
@@ -443,10 +446,12 @@ func getMigrationsInBatch(tx *pg.Tx, batch int) ([]string, error) {
 func getBatchNumber(tx *pg.Tx) (int, error) {
 	var result int
 
-	_, err := tx.Query(&result, "select max(batch) from ?", pg.Q(migrationTableName))
-
+	err := tx.Model().
+		Table(migrationTableName).
+		ColumnExpr("max(batch)").
+		Select(&result)
 	if err != nil {
-		return 0, err
+		return 0, errors.Wrap(err, "getBatchNumber failed")
 	}
 
 	return result, nil
@@ -531,8 +536,8 @@ func createMigrationFile(filename, funcName, templateString string) (string, err
 var migrationTemplate = `package main
 
 import (
-	"github.com/go-pg/pg"
-	migrations "github.com/getkalido/hb_migrations"
+	migrations "github.com/dbreedt/hb_migrations"
+	"github.com/go-pg/pg/v10"
 )
 
 func init() {
